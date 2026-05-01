@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use ppk2::types::{Level, LogicPortPins};
+use ppk2::{
+    measurement::Measurement,
+    types::{Level, LogicPortPins},
+};
 use serde::{
     de::{Deserialize, Deserializer, Error, Visitor},
     ser::{Serialize, Serializer},
@@ -49,9 +52,9 @@ impl From<Pins> for Section {
 
 impl Display for Section {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write_arg!(f, "SECTION", self.pins.to_string())?;
-        write_arg!(f, "µs", self.total_duration.as_micros())?;
-        write_arg!(f, "µAh", self.total_capacity.as_micros())?;
+        writeln!(f, "section: {} ", self.pins.to_string())?;
+        write_arg!(f, "  total µs", self.total_duration.as_micros())?;
+        write_arg!(f, "  total µAh", self.total_capacity.as_micros())?;
         Ok(())
     }
 }
@@ -62,7 +65,8 @@ pub struct Sections([Section; 256]);
 
 impl Display for Sections {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write_arg!(f, "TOTAL CAPACITY", self.total_capacity())?;
+        write_arg!(f, "\nAll sections: total capacity", self.total_capacity())?;
+        write!(f, "\n")?;
 
         for section in self.0.iter() {
             match *section {
@@ -108,6 +112,16 @@ impl Sections {
             })
             .unwrap()
             .total_duration
+    }
+
+    /// Update the Sections with a measurement and the duration of that measurement
+    pub fn update_with(&mut self, measurement: Measurement, duration: Duration) {
+        let section = &mut self[Pins::from(measurement.pins)];
+
+        // µA * µs = A*s*(µ^2)
+        // h:  sec / 60^2
+        section.total_capacity += measurement.micro_amps * (duration.as_micros() as f32);
+        section.total_duration += duration;
     }
 }
 

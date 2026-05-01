@@ -12,26 +12,36 @@ use ppk2::{
     types::{DevicePower, MeasurementMode},
 };
 
+// Used for time management
 use std::{
+    env::set_current_dir,
+    path::Path,
+    process::Command,
     sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
-
-// Used for flashing
-use run_script::run_script;
 
 /// The experiment setup.
 /// Create a new setup with [Setup::new]
 /// Flash a device with a custom flash script with [Setup::flash]
 /// Then measure with [Setup::measure] which returns a [Sections] object.
 pub struct Setup {
+    /// The ppk2 is wrapped in an Option type to keep it live during the lifetime
+    /// of Setup. When Ppk2 is moved (in [Ppk2::start_measurement]) we take the
+    /// value from [Setup::ppk2] leaving a None value. When the measurement is
+    /// completed we put it back. This is done with the appropriatly named
+    /// [Setup::take] and [Setup::put] functions.
     ppk2: Option<Ppk2>,
-    rate: Rate,
+    /// The rate that will be measured with
+    /// Will not update the rate of a measurement while mid measurement
+    pub rate: Rate,
 }
 
 /// All functionality in one test to keep the lifetime of the ppk2 alive
 /// Needed to make the ppk2 not shut off when borrowed
 impl Setup {
+    const DETECT_POWER_THRESHOLD: f32 = 500.0;
+
     /// Creates a new setup which tries to connect to a ppk2 device if a port is
     /// provided. If not it tries to find a connected ppk2 device.
     pub fn new(ppk2_port: Option<String>, rate: Rate) -> Setup {
@@ -54,91 +64,80 @@ impl Setup {
     /// This flash script is executed in a tmp folder thus when flashing from
     /// source a 'git clone' or a 'cd' to the directory of the embedded project
     /// is needed (see examples).
-    pub fn flash(&mut self, flash_script: &str) {
-        self.power_enable();
-        self.wait_until_power(500.0);
-        // Defaults to sh on unix and cmd on windows
-        let (code, output, error) = run_script!(flash_script).unwrap();
+    pub fn flash(&mut self, path_to_project_dir: &Path, flash_command: &mut Command) {
+        // We enable the power to the device and wait untill it detects power
+        self.power_enable_detect();
 
-        println!("EXIT:\n{}", code);
-        println!("OUTPUT:\n{}", output);
-        println!("ERROR:\n{}", error);
+        set_current_dir(path_to_project_dir).unwrap();
+        let status = flash_command.status().expect("COMMAND FAILED");
 
-        if code != 0 {
-            todo!("Handle a non-0 exit status for flashing");
-        }
         self.power_disable();
+        if !status.success() {
+            panic!("{}", status);
+        } else {
+            println!("{}", status);
+        }
     }
 
     /// Starts a measurement for a certain duration
-    pub fn measure(&mut self, duration: Duration) -> Result<Sections, RecvTimeoutError> {
+    pub fn measure(&mut self, duration: Duration) -> Sections {
+        self.power_enable_detect();
         let ppk2 = self.take();
         let (rcv, stop) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
 
         let mut sections = Sections::new();
-        let start = Instant::now();
-        let mut prev = start.clone();
+        let init = Instant::now();
+        let mut end = init;
 
-        let ret = loop {
+        loop {
             // Check if the end of the previous average has exceeded the time limit
             // Enforces no measurement when duration is 0.0
-            if prev.duration_since(start) > duration {
-                break Ok(sections);
+            if end.duration_since(init) > duration {
+                break;
             }
+
+            // Get the previous ending timestamp and label it as the start of this
+            // measurement.
+            let start = end;
 
             // Blocking call recv_timeout
             let rcv_res = rcv.recv_timeout(Duration::from_secs(2));
 
-            // Only get time after the measurement has come in
-            // now - prev is the time measured
-            let now = Instant::now();
+            // Get the timestamp of receiving the measurements and label it as
+            // the end of the measurement
+            end = Instant::now();
 
+            // Handle the received response
             match rcv_res {
                 Ok(MeasurementMatch::Match(m)) => {
-                    let mut section = sections[Pins::from(m.pins)];
-                    let duration_span = now.duration_since(prev);
-
-                    // µA * µs = A*s*(µ^2)
-                    // h:  sec / 60^2
-                    section.total_capacity += m.micro_amps * (duration_span.as_micros() as f32);
-                    section.total_duration += duration_span;
-
-                    prev = now;
-                    sections[Pins::from(m.pins)] = section;
+                    sections.update_with(m, end.duration_since(start))
                 }
-                Ok(MeasurementMatch::NoMatch) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    break Ok(sections);
+                Ok(MeasurementMatch::NoMatch) => {
+                    todo!("we match on everything always thus this should never happen")
                 }
-                Err(e) => {
-                    break Err(e);
-                }
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(_) => todo!("handle"),
             }
-        };
+        }
         self.stop_and_put(stop);
-        ret
+        sections
     }
 
-    /// Waits until a certain µA have been measured
-    pub fn wait_until_power(&mut self, micro_amps: f32) {
+    /// Waits until power has been detected and measured
+    pub fn power_enable_detect(&mut self) {
+        self.power_enable();
         let ppk2 = self.take();
         let (rcv, stop) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
-        let ret = loop {
+        loop {
             match rcv.recv_timeout(Duration::from_secs(2)) {
-                Ok(MeasurementMatch::Match(m)) if m.micro_amps > micro_amps => break,
-                // Ok(MeasurementMatch::Match(m)) => {
-                //     println!("{}",m.micro_amps);
-                //     continue
-                // },
-                Ok(_) => continue,
-                Err(_) => {
-                    self.stop_and_put(stop);
-                    todo!("Error in wait_until_power")
+                Ok(MeasurementMatch::Match(m)) if m.micro_amps > Self::DETECT_POWER_THRESHOLD => {
+                    break;
                 }
+                Ok(_) => continue,
+                Err(_) => todo!("Error in wait_until_power"),
             }
-        };
-        self.stop_and_put(stop);
-        ret
+        }
+        self.stop_and_put(stop)
     }
 
     /// Enables the power on the ppk2 device
@@ -153,15 +152,6 @@ impl Setup {
         let mut ppk2 = self.take();
         ppk2.set_device_power(DevicePower::Disabled).unwrap();
         self.put(ppk2);
-    }
-    /// Retrieves the rate that is set in Setup
-    pub fn get_rate(&mut self) -> Rate {
-        self.rate
-    }
-
-    /// Sets the rate, does not update rate mid measurement
-    pub fn set_rate(&mut self, rate: Rate) {
-        self.rate = rate;
     }
 
     // Borrow the ppk2 and leave a None value such that it can not be accessed
@@ -178,10 +168,7 @@ impl Setup {
     /// As Ppk2 is moved in [Ppk2::start_measurement] we need to handle it
     /// keep it alive. This is done via Option::take()
     fn stop_and_put(&mut self, stop: impl FnOnce() -> Result<Ppk2, ppk2::Error>) {
-        self.put(match stop() {
-            Ok(ppk2) => ppk2,
-            Err(_) => todo!("handle error in stop_and_put"),
-        });
+        self.put(stop().unwrap());
     }
 }
 
@@ -193,28 +180,26 @@ pub struct Rate(u32);
 impl Rate {
     /// Constant value which represents the *minimum* samples per second that can
     /// be passed to the ppk2.
-    const MIN_SPS: u32 = 1;
+    pub const MIN_SPS: u32 = 1;
 
     /// Constant value which represents the *maximum* samples per second that can
     /// be passed to the ppk2.
-    const MAX_SPS: u32 = 100_000;
+    pub const MAX_SPS: u32 = 100_000;
 
     /// Rate which results in a fine granularity in measurements
-    /// ```
-    /// + More accurate
-    /// + Can spot outliers with effects on powerconsumption > 10 µseconds
-    /// - Higher storage usage
-    /// - Outliers can skew metrics like averages
-    /// ```
+    ///
+    /// (+) More accurate
+    /// (+) Can spot outliers with effects on powerconsumption > 10 µseconds
+    /// (-) Higher storage usage
+    /// (-) Outliers can skew metrics like averages
     pub const FINE: Rate = Rate(Rate::MAX_SPS);
 
     /// Rate which results in a coarse granularity in measurements
-    /// ```
-    /// - Less accurate
-    /// - It is harder to spot single instruction outliers
-    /// + Lower storage usage
-    /// + Good for comparing average loads
-    /// ```
+    ///
+    /// (-) Less accurate
+    /// (-) It is harder to spot single instruction outliers
+    /// (+) Lower storage usage
+    /// (+) Good for comparing average loads
     pub const COARSE: Rate = Rate(10_000);
 
     /// Rate data constructor

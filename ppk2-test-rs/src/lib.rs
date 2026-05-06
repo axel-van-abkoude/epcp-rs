@@ -16,10 +16,24 @@ use ppk2::{
 use std::{
     env::set_current_dir,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
+
+/// Macro to help with [Setup::flash]
+/// Gets a stream of child process and displays it in the parent stdout
+/// in a given format
+macro_rules! pipe_fmt {
+    ($stream:expr, $format:expr) => {
+        if let Some(stream) = $stream.take() {
+            let reader = std::io::BufReader::new(stream);
+            for line in std::io::BufRead::lines(reader).flatten() {
+                println!($format, line);
+            }
+        }
+    };
+}
 
 /// The experiment setup.
 /// Create a new setup with [Setup::new]
@@ -69,14 +83,23 @@ impl Setup {
         self.power_enable_detect();
 
         set_current_dir(path_to_project_dir).unwrap();
-        let status = flash_command.status().expect("COMMAND FAILED");
+        let mut child = flash_command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning flash_command");
+
+        // Pipe child stdout and stderr to parent stdout
+        pipe_fmt!(child.stderr, "[stderr] {}");
+        pipe_fmt!(child.stdout, "[stdout] {}");
+
+        // Wait for the child to finish
+        let exit_child = child.wait().unwrap();
+        if !exit_child.success() {
+            todo!("handle");
+        }
 
         self.power_disable();
-        if !status.success() {
-            panic!("{}", status);
-        } else {
-            println!("{}", status);
-        }
     }
 
     /// Starts a measurement for a certain duration

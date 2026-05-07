@@ -5,7 +5,7 @@
 use ppk2_test_rs::{Rate, Setup};
 use std::{path::Path, process::Command};
 
-const EXPERIMENT: &str = "exp_measure_micros";
+const EXPERIMENT: &str = "pin_influence";
 const PATH: &str = "../experiments";
 
 fn main() {

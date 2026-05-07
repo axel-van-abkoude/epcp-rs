@@ -19,12 +19,12 @@ use serde::{
 
 macro_rules! write_arg {
     ($f:expr, $label:expr, $arg:expr) => {{
-        writeln!(
+        write!(
             $f,
             "{}:{:>width$}",
             $label,
             $arg,
-            width = $f.width().unwrap_or(40) - $label.chars().count() - 1,
+            width = $f.width().unwrap_or(30) - $label.chars().count() - 1,
         )
     }};
 }
@@ -52,9 +52,10 @@ impl From<Pins> for Section {
 
 impl Display for Section {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "section: {} ", self.pins.to_string())?;
-        write_arg!(f, "  total µs", self.total_duration.as_micros())?;
-        write_arg!(f, "  total µAh", self.total_capacity.as_micros())?;
+        write_arg!(f, "| section", self.pins.to_string())?;
+        write_arg!(f, " | total µs", self.total_duration.as_micros())?;
+        write_arg!(f, " | total µAh", self.total_capacity.as_micros())?;
+        writeln!(f, "|")?;
         Ok(())
     }
 }
@@ -65,8 +66,18 @@ pub struct Sections([Section; 256]);
 
 impl Display for Sections {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write_arg!(f, "\nAll sections: total capacity", self.total_capacity())?;
-        write!(f, "\n")?;
+        writeln!(f, "{}", "=".repeat(91))?;
+        writeln!(
+            f,
+            "|Total time measurement (ms): {:>60}|",
+            self.total_duration().as_millis()
+        )?;
+        writeln!(
+            f,
+            "|Total capacity measurement:  {:>60}|",
+            self.total_capacity()
+        )?;
+        writeln!(f, "|{}|", "-".repeat(89))?;
 
         for section in self.0.iter() {
             match *section {
@@ -80,6 +91,7 @@ impl Display for Sections {
                 }
             }
         }
+        writeln!(f, "{}", "=".repeat(91))?;
         Ok(())
     }
 }
@@ -142,6 +154,7 @@ impl Add for Capacity {
         self
     }
 }
+
 impl AddAssign<Capacity> for Capacity {
     fn add_assign(&mut self, rhs: Capacity) {
         *self = *self + rhs;
@@ -157,6 +170,14 @@ impl AddAssign<f32> for Capacity {
 impl Capacity {
     /// Zero capacity
     pub const ZERO: Capacity = Capacity(0i64);
+
+    /// 500 µA
+    pub const MICROS_500: Capacity = Capacity(500i64);
+
+    /// Create a capacity from micro_amps
+    pub fn from_micros(micros: f32) -> Self {
+        Self(micros as i64)
+    }
 
     /// Capacity returned as µA
     pub fn as_micros(self) -> i64 {

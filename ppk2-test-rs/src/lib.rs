@@ -54,7 +54,7 @@ pub struct Setup {
 /// All functionality in one test to keep the lifetime of the ppk2 alive
 /// Needed to make the ppk2 not shut off when borrowed
 impl Setup {
-    const DETECT_POWER_THRESHOLD: f32 = 500.0;
+    const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 
     /// Creates a new setup which tries to connect to a ppk2 device if a port is
     /// provided. If not it tries to find a connected ppk2 device.
@@ -65,7 +65,7 @@ impl Setup {
         };
 
         let mut ppk2 = Ppk2::new(serial_port.clone(), MeasurementMode::Ampere).unwrap();
-        //ppk2.set_source_voltage(SourceVoltage::from_millivolts(800)).unwrap();
+
         ppk2.set_device_power(DevicePower::Disabled).unwrap();
 
         Setup {
@@ -79,17 +79,23 @@ impl Setup {
     /// source a 'git clone' or a 'cd' to the directory of the embedded project
     /// is needed (see examples).
     pub fn flash(&mut self, path_to_project_dir: &Path, flash_command: &mut Command) {
-        // We enable the power to the device and wait untill it detects power
-        self.power_enable_detect();
+        // We enable the power to the device as otherwise we soft brick the
+        // device while flashing
+        self.power_enable();
 
+        // We wait until we actually measure some power to continue.
+        //
+        // In the case of the nRF52840 we measure negative current
+        // when the power is not provided to the board.
+        self.wait_until(Predicate::Capacity(Capacity::ZERO));
+
+        // We flash the device and pipe stdout and stderr of the child to the terminal
         set_current_dir(path_to_project_dir).unwrap();
         let mut child = flash_command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawning flash_command");
-
-        // Pipe child stdout and stderr to parent stdout
         pipe_fmt!(child.stderr, "[stderr] {}");
         pipe_fmt!(child.stdout, "[stdout] {}");
 
@@ -98,14 +104,13 @@ impl Setup {
         if !exit_child.success() {
             todo!("handle");
         }
-
         self.power_disable();
     }
 
     /// Starts a measurement for a certain duration
-    pub fn measure(&mut self, duration: Duration) -> Sections {
-        self.power_enable_detect();
+    pub fn measure(&mut self, predicate: Predicate) -> Sections {
         let ppk2 = self.take();
+
         let (rcv, stop) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
 
         let mut sections = Sections::new();
@@ -115,7 +120,7 @@ impl Setup {
         loop {
             // Check if the end of the previous average has exceeded the time limit
             // Enforces no measurement when duration is 0.0
-            if end.duration_since(init) > duration {
+            if predicate.eval_duration(init, end).unwrap_or(false) {
                 break;
             }
 
@@ -124,7 +129,7 @@ impl Setup {
             let start = end;
 
             // Blocking call recv_timeout
-            let rcv_res = rcv.recv_timeout(Duration::from_secs(2));
+            let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
 
             // Get the timestamp of receiving the measurements and label it as
             // the end of the measurement
@@ -132,32 +137,60 @@ impl Setup {
 
             // Handle the received response
             match rcv_res {
+                Ok(MeasurementMatch::Match(m))
+                    if predicate
+                        .eval_capacity(Capacity::from_micros(m.micro_amps))
+                        .unwrap_or(false) =>
+                {
+                    // println!("{} > {}",Pins::from(m.pins).to_string(),m.micro_amps);
+                    break;
+                }
+                Ok(MeasurementMatch::Match(m))
+                    if predicate.eval_pins(Pins::from(m.pins)).unwrap_or(false) =>
+                {
+                    // println!("{} < {}",Pins::from(m.pins).to_string(),m.micro_amps);
+                    break;
+                }
                 Ok(MeasurementMatch::Match(m)) => {
-                    sections.update_with(m, end.duration_since(start))
+                    sections.update_with(m, end.duration_since(start));
                 }
                 Ok(MeasurementMatch::NoMatch) => {
                     todo!("we match on everything always thus this should never happen")
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
-                Err(_) => todo!("handle"),
+                Err(_) => todo!("Error in measure"),
             }
         }
         self.stop_and_put(stop);
         sections
     }
 
-    /// Waits until power has been detected and measured
-    pub fn power_enable_detect(&mut self) {
-        self.power_enable();
+    /// Waits until a predicate holds
+    pub fn wait_until(&mut self, p: Predicate) {
         let ppk2 = self.take();
-        let (rcv, stop) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
+        let (rcv, stop) = ppk2.start_measurement(Rate::COARSE.as_usize()).unwrap();
+        let init = Instant::now();
+        let mut end = init;
         loop {
-            match rcv.recv_timeout(Duration::from_secs(2)) {
-                Ok(MeasurementMatch::Match(m)) if m.micro_amps > Self::DETECT_POWER_THRESHOLD => {
+            if p.eval_duration(init, end).unwrap_or(false) {
+                break;
+            }
+            let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
+            end = Instant::now();
+            match rcv_res {
+                Ok(MeasurementMatch::Match(m))
+                    if p.eval_capacity(Capacity::from_micros(m.micro_amps))
+                        .unwrap_or(false) =>
+                {
+                    break;
+                }
+                Ok(MeasurementMatch::Match(m))
+                    if p.eval_pins(Pins::from(m.pins)).unwrap_or(false) =>
+                {
                     break;
                 }
                 Ok(_) => continue,
-                Err(_) => todo!("Error in wait_until_power"),
+                Err(_) => todo!("Error in wait_until"),
             }
         }
         self.stop_and_put(stop)
@@ -243,5 +276,56 @@ impl Rate {
     /// Returns the rate as samples per second in usize
     pub fn as_usize(self) -> usize {
         self.0 as usize
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub enum Predicate {
+    Duration(Duration),
+    Pins(Pins),
+    Capacity(Capacity),
+    Not(Box<Predicate>),
+    //Memory(Memory),
+    //And(Box<Predicate>, Box<Predicate>),
+    //Or(Box<Predicate>, Box<Predicate>),
+    //Xor(Box<Predicate>, Box<Predicate>),
+}
+
+#[allow(missing_docs)]
+impl Predicate {
+    pub fn eval_duration(&self, from: Instant, until: Instant) -> Option<bool> {
+        match self {
+            Predicate::Duration(duration) => Some(until.duration_since(from) > *duration),
+            Predicate::Not(pred) => match pred.eval_duration(from, until) {
+                Some(p) => Some(!p),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn eval_pins(&self, current_pins: Pins) -> Option<bool> {
+        match self {
+            Predicate::Pins(compare_pins) => Some(current_pins == *compare_pins),
+            Predicate::Not(pred) => match pred.eval_pins(current_pins) {
+                Some(p) => Some(!p),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn eval_capacity(&self, current_capacity: Capacity) -> Option<bool> {
+        match self {
+            Predicate::Capacity(compare_capacity) => {
+                Some(current_capacity.as_micros() > compare_capacity.as_micros())
+            }
+            Predicate::Not(pred) => match pred.eval_capacity(current_capacity) {
+                Some(p) => Some(!p),
+                None => None,
+            },
+            _ => None,
+        }
     }
 }

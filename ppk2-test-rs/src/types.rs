@@ -52,9 +52,13 @@ impl From<Pins> for Section {
 
 impl Display for Section {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write_arg!(f, "| section", self.pins.to_string())?;
-        write_arg!(f, " | total µs", self.total_duration.as_micros())?;
-        write_arg!(f, " | total µAh", self.total_capacity.as_micros())?;
+        write_arg!(
+            f,
+            "| section",
+            String::new() + "(" + &u8::from(self.pins).to_string() + ") " + &self.pins.to_string()
+        )?;
+        write_arg!(f, " | µs", self.total_duration.as_micros())?;
+        write_arg!(f, " | µAh", self.total_capacity.as_micros())?;
         writeln!(f, "|")?;
         Ok(())
     }
@@ -67,18 +71,6 @@ pub struct Sections([Section; 256]);
 impl Display for Sections {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", "=".repeat(91))?;
-        writeln!(
-            f,
-            "|Total time measurement (ms): {:>60}|",
-            self.total_duration().as_millis()
-        )?;
-        writeln!(
-            f,
-            "|Total capacity measurement:  {:>60}|",
-            self.total_capacity()
-        )?;
-        writeln!(f, "|{}|", "-".repeat(89))?;
-
         for section in self.0.iter() {
             match *section {
                 Section {
@@ -91,7 +83,19 @@ impl Display for Sections {
                 }
             }
         }
-        writeln!(f, "{}", "=".repeat(91))?;
+        writeln!(f, "|{}|", "-".repeat(89))?;
+        write_arg!(f,"| Total Measurement","")?;
+        write_arg!(
+            f,
+            " | µs",
+            self.total_duration().as_micros()
+        )?;
+        write_arg!(
+            f,
+            " | µAh",
+            self.total_capacity()
+        )?;
+        writeln!(f, "|\n{}", "=".repeat(91))?;
         Ok(())
     }
 }

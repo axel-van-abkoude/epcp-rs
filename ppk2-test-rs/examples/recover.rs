@@ -7,7 +7,7 @@
 //! https://docs.nordicsemi.com/bundle/nrfutil/page/guides/installing.html
 //!
 
-use ppk2_test_rs::{Rate, Setup};
+use ppk2_test_rs::Setup;
 use std::{io::stdin, path::Path, process::Command};
 
 /// Traits to filter devices on
@@ -18,7 +18,7 @@ use std::{io::stdin, path::Path, process::Command};
 const TRAITS: &str = "devkit";
 
 fn main() {
-    let mut setup = Setup::new(None, Rate::FINE);
+    let mut setup = Setup::find();
 
     // First list the devices with the devkit trait
     setup.flash(
@@ -32,11 +32,9 @@ fn main() {
 
     println!("Recover these devices (y/n)?");
 
-    // Interrupt driven (No busy wait)
+    // When 'y' is found use recover functionality
     let mut buffer = String::new();
     stdin().read_line(&mut buffer).unwrap();
-
-    // Catches 'y' or 'n'. Otherwise loops.
     match buffer.chars().nth(0).unwrap() {
         'y' => {
             setup.flash(

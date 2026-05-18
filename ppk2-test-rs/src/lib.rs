@@ -15,6 +15,7 @@ use ppk2::{
 // Used for time management
 use std::{
     env::set_current_dir,
+    io::{self, Write},
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::RecvTimeoutError,
@@ -56,41 +57,44 @@ pub struct Setup {
 impl Setup {
     const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 
-    /// Creates a new setup which tries to connect to a ppk2 device if a port is
-    /// provided. If not it tries to find a connected ppk2 device.
-    pub fn new(ppk2_port: Option<String>, rate: Rate) -> Setup {
-        let serial_port = match ppk2_port {
-            Some(p) => p,
-            None => try_find_ppk2_port().unwrap(),
-        };
-
-        let mut ppk2 = Ppk2::new(serial_port.clone(), MeasurementMode::Ampere).unwrap();
+    /// Creates a new setup from a specified port with a [Rate::FINE] rate.
+    pub fn new(ppk2_port: String) -> Setup {
+        let mut ppk2 = Ppk2::new(ppk2_port, MeasurementMode::Ampere).unwrap();
 
         ppk2.set_device_power(DevicePower::Disabled).unwrap();
 
         Setup {
             ppk2: Some(ppk2),
-            rate: rate,
+            rate: Rate::FINE,
         }
     }
 
-    /// Flashes the device with a given flash_script
-    /// This flash script is executed in a tmp folder thus when flashing from
-    /// source a 'git clone' or a 'cd' to the directory of the embedded project
-    /// is needed (see examples).
-    pub fn flash(&mut self, path_to_project_dir: &Path, flash_command: &mut Command) {
-        // We enable the power to the device as otherwise we soft brick the
-        // device while flashing
+    /// Tries to find a ppk2_port and creates a new setup from it.
+    pub fn find() -> Setup {
+        Self::new(try_find_ppk2_port().unwrap())
+    }
+
+    /// Flashes the device with a given flash command from a specified path.
+    ///
+    /// Flashing while the ppk2 is connected without providing power will
+    /// soft brick the target. As providing power is not instant this function
+    /// will wait until it detects power.
+    ///
+    /// For the nRF52840 measuring a current greater than 0 is enough to detect
+    /// if enough power is provided to flash. When the target device is soft
+    /// bricked due to not having power one can look to use wait_until on a
+    /// greater current.
+    pub fn flash(&mut self, target_dir: &Path, flash_command: &mut Command) {
         self.power_enable();
 
         // We wait until we actually measure some power to continue.
         //
         // In the case of the nRF52840 we measure negative current
         // when the power is not provided to the board.
-        self.wait_until(Predicate::Capacity(Capacity::ZERO));
+        self.wait_until(When::CurrentGt(Capacity::ZERO));
 
         // We flash the device and pipe stdout and stderr of the child to the terminal
-        set_current_dir(path_to_project_dir).unwrap();
+        set_current_dir(target_dir).unwrap();
         let mut child = flash_command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -107,96 +111,122 @@ impl Setup {
         self.power_disable();
     }
 
-    /// Starts a measurement for a certain duration
-    pub fn measure(&mut self, predicate: Predicate) -> Sections {
+    /// Starts a measurement when a starting condition is true
+    /// Stops when a stopping condition is true
+    pub fn measure(&mut self, start: When, stop: When) -> Sections {
         let ppk2 = self.take();
 
-        let (rcv, stop) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
+        use MeasureStatus::*;
+        let mut status = Waiting;
+
+        let (rcv, stop_ppk2) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
 
         let mut sections = Sections::new();
         let init = Instant::now();
-        let mut end = init;
+        let mut end_sample = init;
 
         loop {
-            // Check if the end of the previous average has exceeded the time limit
-            // Enforces no measurement when duration is 0.0
-            if predicate.eval_duration(init, end).unwrap_or(false) {
-                break;
-            }
-
-            // Get the previous ending timestamp and label it as the start of this
-            // measurement.
-            let start = end;
-
-            // Blocking call recv_timeout
+            // Mark the start and end of this received sample
+            let begin_sample = end_sample;
             let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
+            end_sample = Instant::now();
+            let duration_sample = end_sample.duration_since(begin_sample);
 
-            // Get the timestamp of receiving the measurements and label it as
-            // the end of the measurement
-            end = Instant::now();
-
-            // Handle the received response
+            // When data is found update the sections according to the predicates
+            use MeasurementMatch::*;
+            use RecvTimeoutError::*;
             match rcv_res {
-                Ok(MeasurementMatch::Match(m))
-                    if predicate
-                        .eval_capacity(Capacity::from_micros(m.micro_amps))
-                        .unwrap_or(false) =>
-                {
-                    // println!("{} > {}",Pins::from(m.pins).to_string(),m.micro_amps);
-                    break;
-                }
-                Ok(MeasurementMatch::Match(m))
-                    if predicate.eval_pins(Pins::from(m.pins)).unwrap_or(false) =>
-                {
-                    // println!("{} < {}",Pins::from(m.pins).to_string(),m.micro_amps);
-                    break;
-                }
-                Ok(MeasurementMatch::Match(m)) => {
-                    sections.update_with(m, end.duration_since(start));
-                }
-                Ok(MeasurementMatch::NoMatch) => {
+                Ok(Match(m)) => match status {
+                    Waiting => {
+                        Self::print_status(
+                            "Waiting",
+                            Pins::from(m.pins),
+                            Capacity::from_micros(m.micro_amps),
+                            end_sample.duration_since(init),
+                        );
+
+                        // Update the status when the starting predicate is true
+                        if start.eval(
+                            end_sample.duration_since(init),
+                            Pins::from(m.pins),
+                            Capacity::from_micros(m.micro_amps),
+                        ) {
+                            status = Measuring;
+
+                            // Include the sample in the section as the predicate
+                            // holds in the current sample
+                            sections.update_with(m, duration_sample);
+                        }
+                    }
+                    Measuring => {
+                        Self::print_status(
+                            "Measuring",
+                            Pins::from(m.pins),
+                            Capacity::from_micros(m.micro_amps),
+                            end_sample.duration_since(init),
+                        );
+
+                        // Stop measuring if the stopping predicate is true
+                        if stop.eval(
+                            end_sample.duration_since(init),
+                            Pins::from(m.pins),
+                            Capacity::from_micros(m.micro_amps),
+                        ) {
+                            break;
+                        }
+
+                        // Exclude the sample in the section as the predicate
+                        // does not hold in the current sample
+                        sections.update_with(m, duration_sample);
+                    }
+                },
+                Ok(NoMatch) => {
                     todo!("we match on everything always thus this should never happen")
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(Disconnected) => break,
                 Err(_) => todo!("Error in measure"),
             }
         }
-        self.stop_and_put(stop);
+        println!(" => Measurement Completed!");
+        self.stop_and_put(stop_ppk2);
         sections
     }
 
-    /// Waits until a predicate holds
-    pub fn wait_until(&mut self, p: Predicate) {
+    /// Waits and stops when a stopping condition holds
+    pub fn wait_until(&mut self, stop: When) {
         let ppk2 = self.take();
-        let (rcv, stop) = ppk2.start_measurement(Rate::COARSE.as_usize()).unwrap();
+        let (rcv, stop_ppk2) = ppk2.start_measurement(Rate::COARSE.as_usize()).unwrap();
         let init = Instant::now();
-        let mut end = init;
         loop {
-            if p.eval_duration(init, end).unwrap_or(false) {
-                break;
-            }
             let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
-            end = Instant::now();
+            let end_sample = Instant::now();
             match rcv_res {
-                Ok(MeasurementMatch::Match(m))
-                    if p.eval_capacity(Capacity::from_micros(m.micro_amps))
-                        .unwrap_or(false) =>
-                {
-                    break;
-                }
-                Ok(MeasurementMatch::Match(m))
-                    if p.eval_pins(Pins::from(m.pins)).unwrap_or(false) =>
-                {
-                    break;
+                // Stop if the stopping predicate holds
+                Ok(MeasurementMatch::Match(m)) => {
+                    Self::print_status(
+                        "Waiting",
+                        Pins::from(m.pins),
+                        Capacity::from_micros(m.micro_amps),
+                        end_sample.duration_since(init),
+                    );
+                    if stop.eval(
+                        end_sample.duration_since(init),
+                        Pins::from(m.pins),
+                        Capacity::from_micros(m.micro_amps),
+                    ) {
+                        break;
+                    }
                 }
                 Ok(_) => continue,
                 Err(_) => todo!("Error in wait_until"),
             }
         }
-        self.stop_and_put(stop)
+        println!(" => Stopped Waiting.");
+        self.stop_and_put(stop_ppk2)
     }
 
     /// Enables the power on the ppk2 device
+    /// This does not have an immediate effect on the target board
     pub fn power_enable(&mut self) {
         let mut ppk2 = self.take();
         ppk2.set_device_power(DevicePower::Enabled).unwrap();
@@ -204,27 +234,35 @@ impl Setup {
     }
 
     /// Disables the power on the ppk2 device
+    /// This does not have an immediate effect on the target board
     pub fn power_disable(&mut self) {
         let mut ppk2 = self.take();
         ppk2.set_device_power(DevicePower::Disabled).unwrap();
         self.put(ppk2);
     }
 
-    // Borrow the ppk2 and leave a None value such that it can not be accessed
-    // by two functions at once
     fn take(&mut self) -> Ppk2 {
         self.ppk2.take().unwrap()
     }
 
-    // Release the ppk2 and put it back for other functions to use
     fn put(&mut self, ppk2: Ppk2) {
         self.ppk2 = Some(ppk2);
     }
 
-    /// As Ppk2 is moved in [Ppk2::start_measurement] we need to handle it
-    /// keep it alive. This is done via Option::take()
-    fn stop_and_put(&mut self, stop: impl FnOnce() -> Result<Ppk2, ppk2::Error>) {
-        self.put(stop().unwrap());
+    fn stop_and_put(&mut self, stop_ppk2: impl FnOnce() -> Result<Ppk2, ppk2::Error>) {
+        self.put(stop_ppk2().unwrap());
+    }
+
+    fn print_status(of: &str, pins: Pins, current: Capacity, duration: Duration) {
+        let spinner = ['|', '/', '-', '\\'];
+        print!(
+            "\rpins:{}\t, current:{}\t(Ah)\t {} [{}]",
+            pins.to_string(),
+            current,
+            of,
+            spinner[duration.as_secs() as usize % spinner.len()]
+        );
+        io::stdout().flush().unwrap();
     }
 }
 
@@ -279,53 +317,62 @@ impl Rate {
     }
 }
 
-#[allow(missing_docs)]
 #[derive(Debug, Clone)]
-pub enum Predicate {
-    Duration(Duration),
-    Pins(Pins),
-    Capacity(Capacity),
-    Not(Box<Predicate>),
-    //Memory(Memory),
-    //And(Box<Predicate>, Box<Predicate>),
-    //Or(Box<Predicate>, Box<Predicate>),
-    //Xor(Box<Predicate>, Box<Predicate>),
+/// Predicate for when a measurement should be started or ended
+pub enum When {
+    /// Always evaluates to true
+    Now,
+    /// Always evaluates to false
+    Never,
+    /// An amount of time has elapsed
+    Time(Duration),
+    /// A mark has been identified via a pin configuration
+    Logic(Pins),
+    /// The Current is greater than a value
+    CurrentGt(Capacity),
+    /// The Current is less than a value
+    CurrentLt(Capacity),
+    /// Negates the predicate
+    Not(Box<When>),
+    /// Logical AND
+    And(Box<When>, Box<When>),
+    /// Logical OR
+    Or(Box<When>, Box<When>),
+    /// Logical XOR
+    Xor(Box<When>, Box<When>),
 }
 
-#[allow(missing_docs)]
-impl Predicate {
-    pub fn eval_duration(&self, from: Instant, until: Instant) -> Option<bool> {
+impl When {
+    /// Evaluates the predicate from the information given.
+    pub fn eval(&self, duration: Duration, pins: Pins, capacity: Capacity) -> bool {
+        use When::*;
         match self {
-            Predicate::Duration(duration) => Some(until.duration_since(from) > *duration),
-            Predicate::Not(pred) => match pred.eval_duration(from, until) {
-                Some(p) => Some(!p),
-                None => None,
-            },
-            _ => None,
-        }
-    }
-
-    pub fn eval_pins(&self, current_pins: Pins) -> Option<bool> {
-        match self {
-            Predicate::Pins(compare_pins) => Some(current_pins == *compare_pins),
-            Predicate::Not(pred) => match pred.eval_pins(current_pins) {
-                Some(p) => Some(!p),
-                None => None,
-            },
-            _ => None,
-        }
-    }
-
-    pub fn eval_capacity(&self, current_capacity: Capacity) -> Option<bool> {
-        match self {
-            Predicate::Capacity(compare_capacity) => {
-                Some(current_capacity.as_micros() > compare_capacity.as_micros())
+            Now => true,
+            Never => false,
+            Time(pred_duration) => duration > *pred_duration,
+            Logic(pred_pins) => pins == *pred_pins,
+            CurrentGt(pred_current) => capacity.as_micros() > pred_current.as_micros(),
+            CurrentLt(pred_current) => capacity.as_micros() < pred_current.as_micros(),
+            Not(pred) => !pred.eval(duration, pins, capacity),
+            And(left, right) => {
+                left.eval(duration, pins, capacity) && right.eval(duration, pins, capacity)
             }
-            Predicate::Not(pred) => match pred.eval_capacity(current_capacity) {
-                Some(p) => Some(!p),
-                None => None,
-            },
-            _ => None,
+            Or(left, right) => {
+                left.eval(duration, pins, capacity) || right.eval(duration, pins, capacity)
+            }
+            Xor(left, right) => {
+                left.eval(duration, pins, capacity) ^ right.eval(duration, pins, capacity)
+            }
         }
     }
+}
+
+/// The status of the measurement.
+///
+/// Used in [Setup::measure] to keep track if we are waiting for a predicate to
+/// start measuring or if we are measuring until a predicate holds to stop the
+/// measurement.
+enum MeasureStatus {
+    Waiting,
+    Measuring,
 }

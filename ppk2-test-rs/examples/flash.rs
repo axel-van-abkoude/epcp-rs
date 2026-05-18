@@ -2,14 +2,14 @@
 //! An example that flashes the device with an experiment.
 //!
 
-use ppk2_test_rs::{Rate, Setup};
+use ppk2_test_rs::Setup;
 use std::{path::Path, process::Command};
 
 const EXPERIMENT: &str = "pin_influence";
 const PATH: &str = "../experiments";
 
 fn main() {
-    let mut setup = Setup::new(None, Rate::FINE);
+    let mut setup = Setup::find();
     setup.flash(
         Path::new(PATH),
         Command::new("cargo")

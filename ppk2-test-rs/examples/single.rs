@@ -3,12 +3,8 @@
 //! measurement rates.
 //!
 
-use ppk2_test_rs::{Rate, Setup, When::*, types::Pins};
-use std::{ops::Not, path::Path, process::Command, time::Duration};
-
-const EXPERIMENT: &str = "pin_influence";
-const PATH: &str = "../experiments";
-const WARMUP: Duration = Duration::from_secs(1);
+use ppk2_test_rs::{Setup, When::*, types::Pins};
+use std::{path::Path, process::Command, time::Duration};
 
 // Create a boxed value
 macro_rules! bx {
@@ -16,6 +12,10 @@ macro_rules! bx {
         Box::new($e)
     };
 }
+
+const EXPERIMENT: &str = "pin_influence";
+const PATH: &str = "../experiments";
+const WARMUP: Duration = Duration::from_secs(1);
 
 fn main() {
     let mut setup = Setup::find();
@@ -38,13 +38,9 @@ fn main() {
     setup.wait_until(Time(WARMUP));
     setup.wait_until(Logic(all_zero));
 
-    // Run with sample sizes 10_000 to 100_000 with intervals of 1_000
-    for i in 1..=10 {
-        setup.rate = Rate::from_sps(i * 10_000);
-        println!(
-            "{}^^^^^^ RATE {}0_000 ^^^^^^\n",
-            setup.measure(Not(bx!(Logic(all_zero))), Logic(all_zero)),
-            i
-        );
-    }
+    // Measure from a non 0 pin configuration until 0 has been found
+    println!(
+        "{}",
+        setup.measure(Not(bx!(Logic(all_zero))), Logic(all_zero))
+    );
 }

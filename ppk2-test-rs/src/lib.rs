@@ -4,6 +4,7 @@
 pub mod types;
 use crate::types::*;
 
+use csv::Writer;
 // We use the ppk2-rs library to interface with the Ppk2
 use ppk2::{
     Ppk2,
@@ -14,13 +15,21 @@ use ppk2::{
 
 // Used for time management
 use std::{
-    env::set_current_dir,
+    env::{current_dir, set_current_dir},
+    fmt::Debug,
     io::{self, Write},
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
+
+// Used for serialisation
+use serde::{Deserialize, Serialize};
+
+// Local time for getting the current time as the std lib does not give a
+// general way to get this.
+use chrono::Local;
 
 /// Macro to help with [Setup::flash]
 /// Gets a stream of child process and displays it in the parent stdout
@@ -50,6 +59,8 @@ pub struct Setup {
     /// The rate that will be measured with
     /// Will not update the rate of a measurement while mid measurement
     pub rate: Rate,
+
+    data_dir: String,
 }
 
 /// All functionality in one test to keep the lifetime of the ppk2 alive
@@ -58,14 +69,18 @@ impl Setup {
     const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 
     /// Creates a new setup from a specified port with a [Rate::FINE] rate.
+
     pub fn new(ppk2_port: String) -> Setup {
         let mut ppk2 = Ppk2::new(ppk2_port, MeasurementMode::Ampere).unwrap();
 
         ppk2.set_device_power(DevicePower::Disabled).unwrap();
 
+        Self::print_header();
+
         Setup {
             ppk2: Some(ppk2),
             rate: Rate::FINE,
+            data_dir: String::from("./data"),
         }
     }
 
@@ -93,21 +108,30 @@ impl Setup {
         // when the power is not provided to the board.
         self.wait_until(When::CurrentGt(Capacity::ZERO));
 
-        // We flash the device and pipe stdout and stderr of the child to the terminal
+        // We flash the device from the target directory and pipe stdout and
+        // stderr of the child to capture it in the terminal.
+        let original_dir = current_dir().unwrap();
         set_current_dir(target_dir).unwrap();
         let mut child = flash_command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawning flash_command");
+        set_current_dir(original_dir).unwrap();
+
+        println!("\n==============COMMAND OUTPUT================");
+
         pipe_fmt!(child.stderr, "[stderr] {}");
         pipe_fmt!(child.stdout, "[stdout] {}");
 
-        // Wait for the child to finish
+        // Wait for the child process to finish and give feedback on the code
         let exit_child = child.wait().unwrap();
-        if !exit_child.success() {
-            todo!("handle");
+
+        match exit_child.code() {
+            Some(code) => println!("==============EXIT CODE {:<3}=================\n", code),
+            None => println!("==============TERMINATED====================\n"),
         }
+
         self.power_disable();
     }
 
@@ -125,61 +149,67 @@ impl Setup {
         let init = Instant::now();
         let mut end_sample = init;
 
+        // Create a output csv file
+        let data_path: String = format!(
+            "{}/{}.csv",
+            self.data_dir,
+            Local::now().format("%Y-%m-%d-%H:%M:%S")
+        );
+
+        let mut csv_writer = Writer::from_path(data_path.clone()).unwrap();
+
         loop {
             // Mark the start and end of this received sample
             let begin_sample = end_sample;
             let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
             end_sample = Instant::now();
+
+            // Capture the durations
             let duration_sample = end_sample.duration_since(begin_sample);
+            let timestamp = end_sample.duration_since(init);
 
             // When data is found update the sections according to the predicates
             use MeasurementMatch::*;
             use RecvTimeoutError::*;
             match rcv_res {
-                Ok(Match(m)) => match status {
-                    Waiting => {
-                        Self::print_status(
-                            "Waiting",
-                            Pins::from(m.pins),
-                            Capacity::from_micros(m.micro_amps),
-                            end_sample.duration_since(init),
-                        );
-
-                        // Update the status when the starting predicate is true
-                        if start.eval(
-                            end_sample.duration_since(init),
-                            Pins::from(m.pins),
-                            Capacity::from_micros(m.micro_amps),
-                        ) {
-                            status = Measuring;
-
+                Ok(Match(m)) => {
+                    let pins = Pins::from(m.pins);
+                    let current = Capacity::from_micros(m.micro_amps);
+                    Self::print_status(status.clone(), pins, current, timestamp);
+                    match status {
+                        Waiting => {
+                            // Update the status when the starting predicate is true
                             // Include the sample in the section as the predicate
                             // holds in the current sample
+                            if start.eval(timestamp, pins, current) {
+                                println!(" => Starting Condition Found!");
+                                status = Measuring;
+                                sections.update_with(m, duration_sample);
+                            }
+                        }
+                        Measuring => {
+                            // Stop measuring if the stopping predicate is true
+
+                            // Exclude the sample in the section as the predicate
+                            // does not hold in the current sample
+                            if stop.eval(timestamp, pins, current) {
+                                println!(" => Measurement Completed!");
+                                break;
+                            }
+
+                            // Write to a csv file
+                            csv_writer
+                                .serialize(Sample {
+                                    timestamp: timestamp.as_micros(),
+                                    power: m.micro_amps,
+                                    pins: Pins::from(m.pins),
+                                })
+                                .unwrap();
+
                             sections.update_with(m, duration_sample);
                         }
                     }
-                    Measuring => {
-                        Self::print_status(
-                            "Measuring",
-                            Pins::from(m.pins),
-                            Capacity::from_micros(m.micro_amps),
-                            end_sample.duration_since(init),
-                        );
-
-                        // Stop measuring if the stopping predicate is true
-                        if stop.eval(
-                            end_sample.duration_since(init),
-                            Pins::from(m.pins),
-                            Capacity::from_micros(m.micro_amps),
-                        ) {
-                            break;
-                        }
-
-                        // Exclude the sample in the section as the predicate
-                        // does not hold in the current sample
-                        sections.update_with(m, duration_sample);
-                    }
-                },
+                }
                 Ok(NoMatch) => {
                     todo!("we match on everything always thus this should never happen")
                 }
@@ -187,7 +217,7 @@ impl Setup {
                 Err(_) => todo!("Error in measure"),
             }
         }
-        println!(" => Measurement Completed!");
+        println!("\nData written to: {}\n", data_path);
         self.stop_and_put(stop_ppk2);
         sections
     }
@@ -200,20 +230,16 @@ impl Setup {
         loop {
             let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
             let end_sample = Instant::now();
+            let timestamp = end_sample.duration_since(init);
+
+            use MeasureStatus::*;
             match rcv_res {
                 // Stop if the stopping predicate holds
                 Ok(MeasurementMatch::Match(m)) => {
-                    Self::print_status(
-                        "Waiting",
-                        Pins::from(m.pins),
-                        Capacity::from_micros(m.micro_amps),
-                        end_sample.duration_since(init),
-                    );
-                    if stop.eval(
-                        end_sample.duration_since(init),
-                        Pins::from(m.pins),
-                        Capacity::from_micros(m.micro_amps),
-                    ) {
+                    let pins = Pins::from(m.pins);
+                    let current = Capacity::from_micros(m.micro_amps);
+                    Self::print_status(Waiting, pins, current, timestamp);
+                    if stop.eval(timestamp, pins, current) {
                         break;
                     }
                 }
@@ -253,13 +279,18 @@ impl Setup {
         self.put(stop_ppk2().unwrap());
     }
 
-    fn print_status(of: &str, pins: Pins, current: Capacity, duration: Duration) {
+    fn print_header() {
+        println!("\n  Section  | Current (µA)     | Status");
+        println!("===========================================")
+    }
+
+    fn print_status(status: MeasureStatus, pins: Pins, current: Capacity, duration: Duration) {
         let spinner = ['|', '/', '-', '\\'];
         print!(
-            "\rpins:{}\t, current:{}\t(Ah)\t {} [{}]",
+            "\r| {:<8} | {:<16} | {:<9} | [{}]",
             pins.to_string(),
             current,
-            of,
+            format!("{:?}", status),
             spinner[duration.as_secs() as usize % spinner.len()]
         );
         io::stdout().flush().unwrap();
@@ -372,7 +403,18 @@ impl When {
 /// Used in [Setup::measure] to keep track if we are waiting for a predicate to
 /// start measuring or if we are measuring until a predicate holds to stop the
 /// measurement.
+#[derive(Debug, Clone)]
 enum MeasureStatus {
     Waiting,
     Measuring,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+struct Sample {
+    #[serde(rename = "timestamp (μs)")]
+    timestamp: u128,
+    #[serde(rename = "power (μA)")]
+    power: f32,
+    #[serde(rename = "pins (D0-D7)")]
+    pins: Pins,
 }

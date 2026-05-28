@@ -84,17 +84,9 @@ impl Display for Sections {
             }
         }
         writeln!(f, "|{}|", "-".repeat(89))?;
-        write_arg!(f,"| Total Measurement","")?;
-        write_arg!(
-            f,
-            " | µs",
-            self.total_duration().as_micros()
-        )?;
-        write_arg!(
-            f,
-            " | µAh",
-            self.total_capacity()
-        )?;
+        write_arg!(f, "| Total Measurement", "")?;
+        write_arg!(f, " | µs", self.total_duration().as_micros())?;
+        write_arg!(f, " | µAh", self.total_capacity())?;
         writeln!(f, "|\n{}", "=".repeat(91))?;
         Ok(())
     }

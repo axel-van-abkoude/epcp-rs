@@ -24,9 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Used for serialisation
-use serde::{Deserialize, Serialize};
-
 // Local time for getting the current time as the std lib does not give a
 // general way to get this.
 use chrono::Local;
@@ -106,7 +103,7 @@ impl Setup {
         //
         // In the case of the nRF52840 we measure negative current
         // when the power is not provided to the board.
-        self.wait_until(When::CurrentGt(Capacity::ZERO));
+        self.wait_until(When::CurrentGt(Current::from_micros(0.0)));
 
         // We flash the device from the target directory and pipe stdout and
         // stderr of the child to capture it in the terminal.
@@ -141,13 +138,7 @@ impl Setup {
         let ppk2 = self.take();
 
         use MeasureStatus::*;
-        let mut status = Waiting;
-
-        let (rcv, stop_ppk2) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
-
-        let mut sections = Sections::new();
-        let init = Instant::now();
-        let mut end_sample = init;
+        let mut status = &Waiting;
 
         // Create a output csv file
         let data_path: String = format!(
@@ -158,6 +149,17 @@ impl Setup {
 
         let mut csv_writer = Writer::from_path(data_path.clone()).unwrap();
 
+        let mut sections = Sections::new();
+
+        // Initialise timing where begin signifies the begin of Waiting and is
+        // later updated with the beginning of Measuring
+        let mut begin = Instant::now();
+        // End sample needs to be remembered in the next iteration of the loop
+        // thus it is declared here.
+        let mut end_sample = begin;
+
+        let (rcv, stop_ppk2) = ppk2.start_measurement(self.rate.as_usize()).unwrap();
+
         loop {
             // Mark the start and end of this received sample
             let begin_sample = end_sample;
@@ -166,24 +168,32 @@ impl Setup {
 
             // Capture the durations
             let duration_sample = end_sample.duration_since(begin_sample);
-            let timestamp = end_sample.duration_since(init);
+            let timestamp_sample = end_sample.duration_since(begin);
 
             // When data is found update the sections according to the predicates
             use MeasurementMatch::*;
             use RecvTimeoutError::*;
             match rcv_res {
                 Ok(Match(m)) => {
-                    let pins = Pins::from(m.pins);
-                    let current = Capacity::from_micros(m.micro_amps);
-                    Self::print_status(status.clone(), pins, current, timestamp);
+                    let sample = &Sample {
+                        timestamp: timestamp_sample,
+                        duration: duration_sample,
+                        current: Current::from_micros(m.micro_amps),
+                        pins: Pins::from(m.pins),
+                    };
+
+                    Self::print_status(status, sample);
+
                     match status {
                         Waiting => {
                             // Update the status when the starting predicate is true
                             // Include the sample in the section as the predicate
                             // holds in the current sample
-                            if start.eval(timestamp, pins, current) {
+                            if start.eval(sample) {
                                 println!(" => Starting Condition Found!");
-                                status = Measuring;
+                                status = &Measuring;
+                                // update begin to the begin of the measurement
+                                begin = end_sample;
                                 sections.update_with(m, duration_sample);
                             }
                         }
@@ -192,19 +202,13 @@ impl Setup {
 
                             // Exclude the sample in the section as the predicate
                             // does not hold in the current sample
-                            if stop.eval(timestamp, pins, current) {
+                            if stop.eval(sample) {
                                 println!(" => Measurement Completed!");
                                 break;
                             }
 
                             // Write to a csv file
-                            csv_writer
-                                .serialize(Sample {
-                                    timestamp: timestamp.as_micros(),
-                                    power: m.micro_amps,
-                                    pins: Pins::from(m.pins),
-                                })
-                                .unwrap();
+                            csv_writer.serialize(sample).unwrap();
 
                             sections.update_with(m, duration_sample);
                         }
@@ -226,20 +230,29 @@ impl Setup {
     pub fn wait_until(&mut self, stop: When) {
         let ppk2 = self.take();
         let (rcv, stop_ppk2) = ppk2.start_measurement(Rate::COARSE.as_usize()).unwrap();
-        let init = Instant::now();
+        let begin = Instant::now();
+        let mut end_sample = begin;
         loop {
+            let begin_sample = end_sample;
             let rcv_res = rcv.recv_timeout(Self::TIMEOUT_DURATION);
-            let end_sample = Instant::now();
-            let timestamp = end_sample.duration_since(init);
+            end_sample = Instant::now();
+
+            let duration_sample = end_sample.duration_since(begin_sample);
+            let timestamp_sample = end_sample.duration_since(begin);
 
             use MeasureStatus::*;
+            use MeasurementMatch::*;
             match rcv_res {
                 // Stop if the stopping predicate holds
-                Ok(MeasurementMatch::Match(m)) => {
-                    let pins = Pins::from(m.pins);
-                    let current = Capacity::from_micros(m.micro_amps);
-                    Self::print_status(Waiting, pins, current, timestamp);
-                    if stop.eval(timestamp, pins, current) {
+                Ok(Match(m)) => {
+                    let sample = &Sample {
+                        timestamp: timestamp_sample,
+                        duration: duration_sample,
+                        current: Current::from_micros(m.micro_amps),
+                        pins: Pins::from(m.pins),
+                    };
+                    Self::print_status(&Waiting, sample);
+                    if stop.eval(sample) {
                         break;
                     }
                 }
@@ -280,18 +293,27 @@ impl Setup {
     }
 
     fn print_header() {
-        println!("\n  Section  | Current (µA)     | Status");
-        println!("===========================================")
+        println!("\n  Section  | µs/Sample | Current (µA)     | Status");
+        println!("=======================================================");
     }
 
-    fn print_status(status: MeasureStatus, pins: Pins, current: Capacity, duration: Duration) {
+    fn print_status(
+        status: &MeasureStatus,
+        Sample {
+            timestamp,
+            duration,
+            current,
+            pins,
+        }: &Sample,
+    ) {
         let spinner = ['|', '/', '-', '\\'];
         print!(
-            "\r| {:<8} | {:<16} | {:<9} | [{}]",
+            "\r| {:<8} | {:<9} | {:<16} | {:<9} | [{}]",
             pins.to_string(),
-            current,
+            duration.as_micros(),
+            current.as_micros(),
             format!("{:?}", status),
-            spinner[duration.as_secs() as usize % spinner.len()]
+            spinner[timestamp.as_secs() as usize % spinner.len()]
         );
         io::stdout().flush().unwrap();
     }
@@ -360,9 +382,9 @@ pub enum When {
     /// A mark has been identified via a pin configuration
     Logic(Pins),
     /// The Current is greater than a value
-    CurrentGt(Capacity),
+    CurrentGt(Current),
     /// The Current is less than a value
-    CurrentLt(Capacity),
+    CurrentLt(Current),
     /// Negates the predicate
     Not(Box<When>),
     /// Logical AND
@@ -375,25 +397,27 @@ pub enum When {
 
 impl When {
     /// Evaluates the predicate from the information given.
-    pub fn eval(&self, duration: Duration, pins: Pins, capacity: Capacity) -> bool {
+    pub fn eval(
+        &self,
+        sample @ Sample {
+            timestamp,
+            duration: _,
+            current,
+            pins,
+        }: &Sample,
+    ) -> bool {
         use When::*;
         match self {
             Now => true,
             Never => false,
-            Time(pred_duration) => duration > *pred_duration,
-            Logic(pred_pins) => pins == *pred_pins,
-            CurrentGt(pred_current) => capacity.as_micros() > pred_current.as_micros(),
-            CurrentLt(pred_current) => capacity.as_micros() < pred_current.as_micros(),
-            Not(pred) => !pred.eval(duration, pins, capacity),
-            And(left, right) => {
-                left.eval(duration, pins, capacity) && right.eval(duration, pins, capacity)
-            }
-            Or(left, right) => {
-                left.eval(duration, pins, capacity) || right.eval(duration, pins, capacity)
-            }
-            Xor(left, right) => {
-                left.eval(duration, pins, capacity) ^ right.eval(duration, pins, capacity)
-            }
+            Time(pred_timestamp) => timestamp > pred_timestamp,
+            Logic(pred_pins) => pins == pred_pins,
+            CurrentGt(pred_current) => current > pred_current,
+            CurrentLt(pred_current) => current < pred_current,
+            Not(pred) => !pred.eval(sample),
+            And(left, right) => left.eval(sample) && right.eval(sample),
+            Or(left, right) => left.eval(sample) || right.eval(sample),
+            Xor(left, right) => left.eval(sample) ^ right.eval(sample),
         }
     }
 }
@@ -407,14 +431,4 @@ impl When {
 enum MeasureStatus {
     Waiting,
     Measuring,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-struct Sample {
-    #[serde(rename = "timestamp (μs)")]
-    timestamp: u128,
-    #[serde(rename = "power (μA)")]
-    power: f32,
-    #[serde(rename = "pins (D0-D7)")]
-    pins: Pins,
 }

@@ -13,8 +13,9 @@ use ppk2::{
     types::{Level, LogicPortPins},
 };
 use serde::{
-    de::{Deserialize, Deserializer, Error, Visitor},
-    ser::{Serialize, Serializer},
+    Deserialize, Serialize,
+    de::{Deserializer, Error, Visitor},
+    ser::Serializer,
 };
 
 macro_rules! write_arg {
@@ -338,6 +339,58 @@ impl From<PinLevel> for char {
             Level::High => '1',
             Level::Either => 'x',
         }
+    }
+}
+
+/// One Sample collected by the ppk2 containing:
+/// * the timestamp in the measurement
+/// * the duration of the sample itself
+/// * the average current of the sample
+/// * the most prevalent pin configuration of the sample
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Sample {
+    #[serde(rename = "Timestamp In Measurement (μs)")]
+    #[serde(serialize_with = "ser_duration_micros")]
+    #[allow(missing_docs)]
+    pub timestamp: Duration,
+    #[serde(rename = "Duration Sample (μs)")]
+    #[serde(serialize_with = "ser_duration_micros")]
+    #[allow(missing_docs)]
+    pub duration: Duration,
+    #[serde(rename = "Current Sample (μA)")]
+    #[allow(missing_docs)]
+    pub current: Current,
+    #[serde(rename = "Logic Pins Sample (D0-D7)")]
+    #[allow(missing_docs)]
+    pub pins: Pins,
+}
+
+fn ser_duration_micros<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_u64(d.as_micros() as u64)
+}
+
+/// Current in Ampere stored as μA
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct Current(f32);
+
+impl Current {
+    #[allow(missing_docs)]
+    pub fn from_micros(micros: f32) -> Self {
+        Self(micros)
+    }
+
+    #[allow(missing_docs)]
+    pub fn as_micros(&self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialOrd for Current {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
     }
 }
 

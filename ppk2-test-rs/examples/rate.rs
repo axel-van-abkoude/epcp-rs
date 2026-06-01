@@ -13,13 +13,6 @@ const EXPERIMENT: &str = "pin_influence";
 const PATH: &str = "../experiments";
 const WARMUP: Duration = Duration::from_secs(1);
 
-// Create a boxed value
-macro_rules! bx {
-    ($e:expr) => {
-        Box::new($e)
-    };
-}
-
 fn main() {
     let mut setup = Setup::find();
 
@@ -38,14 +31,14 @@ fn main() {
 
     let all_zero = Pins::from(0u8);
 
-    setup.wait_until(And(bx!(Time(WARMUP)), bx!(Logic(all_zero))));
+    setup.wait_until(Time(WARMUP)& Logic(all_zero));
 
     // Run with sample sizes 10_000 to 100_000 with intervals of 1_000
     for i in 1..=10 {
         setup.rate = Rate::from_sps(i * 10_000);
         println!(
             "{}^^^^^^ RATE {}0_000 ^^^^^^\n",
-            setup.measure(Not(bx!(Logic(all_zero))), Logic(all_zero)),
+            setup.measure(!Logic(all_zero), Logic(all_zero)),
             i
         );
     }

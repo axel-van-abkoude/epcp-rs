@@ -9,13 +9,6 @@ use ppk2_test_rs::{
 };
 use std::{path::Path, process::Command, time::Duration};
 
-// Create a boxed value
-macro_rules! bx {
-    ($e:expr) => {
-        Box::new($e)
-    };
-}
-
 const EXPERIMENT: &str = "pin_influence";
 const PATH: &str = "../experiments";
 const WARMUP: Duration = Duration::from_secs(1);
@@ -36,12 +29,12 @@ fn main() {
     );
     setup.power_enable();
 
-    let all_zero = Pins::from(0u8);
-    setup.wait_until(And(bx!(Time(WARMUP)), bx!(Logic(all_zero))));
+    let all_low = Pins::from(0u8);
+    setup.wait_until(Time(WARMUP) & Logic(all_low));
 
     // Measure from a non 0 pin configuration until 0 has been found
     println!(
         "{}",
-        setup.measure(Not(bx!(Logic(all_zero))), Logic(all_zero))
+        setup.measure(!Logic(all_low), Logic(all_low))
     );
 }

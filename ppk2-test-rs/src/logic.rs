@@ -1,6 +1,6 @@
 //! Logic that gives context to measurements or instructs what is measured
 
-use std::fmt::{self, Formatter};
+use std::{fmt::{self, Formatter}, ops::{BitAnd, BitOr, Not}};
 
 use crate::{data::Sample, unit::Current};
 use ppk2::types::{Level, LogicPortPins};
@@ -32,8 +32,6 @@ pub enum When {
     And(Box<When>, Box<When>),
     /// Logical OR
     Or(Box<When>, Box<When>),
-    /// Logical XOR
-    Xor(Box<When>, Box<When>),
 }
 
 impl When {
@@ -58,8 +56,28 @@ impl When {
             Not(pred) => !pred.eval(sample),
             And(left, right) => left.eval(sample) && right.eval(sample),
             Or(left, right) => left.eval(sample) || right.eval(sample),
-            Xor(left, right) => left.eval(sample) ^ right.eval(sample),
         }
+    }
+}
+
+impl BitAnd for When {
+    type Output = When;
+    fn bitand(self, y: When) -> When {
+        When::And(Box::new(self), Box::new(y))
+    }
+}
+
+impl BitOr for When {
+    type Output = When;
+    fn bitor(self, y: When) -> When {
+        When::And(Box::new(self), Box::new(y))
+    }
+}
+
+impl Not for When {
+    type Output = When;
+    fn not(self) -> When {
+        When::Not(Box::new(self))
     }
 }
 
@@ -79,6 +97,12 @@ pub enum MeasureStatus {
 #[derive(Copy, Debug, Clone)]
 /// Implementation of ppk2-rs LogicPortPins
 pub struct Pins(LogicPortPins);
+impl Pins {
+    /// Pin configuration where they are all set to low
+    pub fn all_low() -> Self {
+        Self(0u8.into())
+    }
+}
 
 impl From<LogicPortPins> for Pins {
     fn from(value: LogicPortPins) -> Self {

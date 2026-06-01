@@ -3,7 +3,10 @@
 //! measurement rates.
 //!
 
-use ppk2_test_rs::{Setup, When::*, types::Pins};
+use ppk2_test_rs::{
+    Setup,
+    logic::{Pins, When::*},
+};
 use std::{path::Path, process::Command, time::Duration};
 
 // Create a boxed value
@@ -34,9 +37,7 @@ fn main() {
     setup.power_enable();
 
     let all_zero = Pins::from(0u8);
-
-    setup.wait_until(Time(WARMUP));
-    setup.wait_until(Logic(all_zero));
+    setup.wait_until(And(bx!(Time(WARMUP)), bx!(Logic(all_zero))));
 
     // Measure from a non 0 pin configuration until 0 has been found
     println!(

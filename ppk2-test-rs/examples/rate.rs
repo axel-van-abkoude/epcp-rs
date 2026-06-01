@@ -3,8 +3,11 @@
 //! measurement rates.
 //!
 
-use ppk2_test_rs::{Rate, Setup, When::*, types::Pins};
-use std::{ops::Not, path::Path, process::Command, time::Duration};
+use ppk2_test_rs::{
+    Rate, Setup,
+    logic::{Pins, When::*},
+};
+use std::{path::Path, process::Command, time::Duration};
 
 const EXPERIMENT: &str = "pin_influence";
 const PATH: &str = "../experiments";
@@ -35,8 +38,7 @@ fn main() {
 
     let all_zero = Pins::from(0u8);
 
-    setup.wait_until(Time(WARMUP));
-    setup.wait_until(Logic(all_zero));
+    setup.wait_until(And(bx!(Time(WARMUP)), bx!(Logic(all_zero))));
 
     // Run with sample sizes 10_000 to 100_000 with intervals of 1_000
     for i in 1..=10 {

@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-pub mod types;
-use crate::types::*;
+// Include datatypes from crate and expose them to lib users
+pub mod data;
+pub mod logic;
+pub mod unit;
 
 use csv::Writer;
 // We use the ppk2-rs library to interface with the Ppk2
@@ -16,7 +18,6 @@ use ppk2::{
 // Used for time management
 use std::{
     env::{current_dir, set_current_dir},
-    fmt::Debug,
     io::{self, Write},
     path::Path,
     process::{Command, Stdio},
@@ -27,6 +28,12 @@ use std::{
 // Local time for getting the current time as the std lib does not give a
 // general way to get this.
 use chrono::Local;
+
+use crate::{
+    data::{Sample, Sections},
+    logic::{MeasureStatus, Pins, When},
+    unit::Current,
+};
 
 /// Macro to help with [Setup::flash]
 /// Gets a stream of child process and displays it in the parent stdout
@@ -368,67 +375,4 @@ impl Rate {
     pub fn as_usize(self) -> usize {
         self.0 as usize
     }
-}
-
-#[derive(Debug, Clone)]
-/// Predicate for when a measurement should be started or ended
-pub enum When {
-    /// Always evaluates to true
-    Now,
-    /// Always evaluates to false
-    Never,
-    /// An amount of time has elapsed
-    Time(Duration),
-    /// A mark has been identified via a pin configuration
-    Logic(Pins),
-    /// The Current is greater than a value
-    CurrentGt(Current),
-    /// The Current is less than a value
-    CurrentLt(Current),
-    /// Negates the predicate
-    Not(Box<When>),
-    /// Logical AND
-    And(Box<When>, Box<When>),
-    /// Logical OR
-    Or(Box<When>, Box<When>),
-    /// Logical XOR
-    Xor(Box<When>, Box<When>),
-}
-
-impl When {
-    /// Evaluates the predicate from the information given.
-    pub fn eval(
-        &self,
-        sample @ Sample {
-            timestamp,
-            duration: _,
-            current,
-            pins,
-        }: &Sample,
-    ) -> bool {
-        use When::*;
-        match self {
-            Now => true,
-            Never => false,
-            Time(pred_timestamp) => timestamp > pred_timestamp,
-            Logic(pred_pins) => pins == pred_pins,
-            CurrentGt(pred_current) => current > pred_current,
-            CurrentLt(pred_current) => current < pred_current,
-            Not(pred) => !pred.eval(sample),
-            And(left, right) => left.eval(sample) && right.eval(sample),
-            Or(left, right) => left.eval(sample) || right.eval(sample),
-            Xor(left, right) => left.eval(sample) ^ right.eval(sample),
-        }
-    }
-}
-
-/// The status of the measurement.
-///
-/// Used in [Setup::measure] to keep track if we are waiting for a predicate to
-/// start measuring or if we are measuring until a predicate holds to stop the
-/// measurement.
-#[derive(Debug, Clone)]
-enum MeasureStatus {
-    Waiting,
-    Measuring,
 }
